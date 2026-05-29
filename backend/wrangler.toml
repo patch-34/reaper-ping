@@ -1,0 +1,11 @@
+name = "patch34-render-telegram-bot"
+main = "worker.js"
+compatibility_date = "2026-05-27"
+
+# Example only. Do not put real secrets in this file.
+# Set the Telegram bot token with:
+# wrangler secret put TELEGRAM_BOT_TOKEN
+
+[[kv_namespaces]]
+binding = "PATCH34_RENDER_BOT_KV"
+id = "be5b5eb3428a4e129a041afed88faf80"
