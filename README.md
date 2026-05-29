@@ -6,7 +6,7 @@
 
 Telegram notifications for REAPER renders.
 
-Reaper Ping opens REAPER’s native Render dialog and sends you a Telegram message when the render is finished.
+Reaper Ping runs REAPER's Render dialog and sends a Telegram notification when rendering is complete.
 
 ## How to use
 
