@@ -5,23 +5,24 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.5
+-- @version 0.2.8
 -- @author Aleksei Vorobev / Patch34
 -- @about
---   v0.2.5 keeps the accepted Variant B backend workflow as the default and
---   adds a watcher guard so switching REAPER project tabs after opening the
---   Render dialog, but before actual render activity is observed, cannot produce
---   a false render-finished Telegram notification. Variant A direct Telegram
---   delivery remains available as an advanced fallback.
+--   v0.2.8 adds a native render-in-progress gate via EnumProjects(0x40000000):
+--   the watcher will not send a notification while REAPER is still rendering,
+--   even if the output file appears stable (heavy system load, lock screen,
+--   disk I/O pauses). This eliminates the class of false positives where file
+--   size stability was mistaken for render completion. All v0.2.7 guards are
+--   preserved. No backend, Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.5"
+local SCRIPT_VERSION = "0.2.8"
 
 ------------------------------------------------------------
 -- User settings
 ------------------------------------------------------------
 
 local SETTINGS = {
-  -- v0.2.5 action mode:
+  -- v0.2.6 action mode:
   --   "render_dialog_with_notification"  Normal user workflow for the REAPER action:
   --                                      Patch34: Render with Telegram notification.
   --                                      Opens REAPER's normal Render dialog, lets the user render manually,
@@ -31,7 +32,7 @@ local SETTINGS = {
   --                                      via action 42230, then send a render-finished notification.
   run_mode = "render_dialog_with_notification",
 
-  -- v0.2.5 delivery mode:
+  -- v0.2.6 delivery mode:
   --   "telegram_direct"          Variant A: send directly to Telegram Bot API using user-owned credentials.
   --   "patch34_backend"          Variant B: send through the shared Patch34 backend using a device token.
   delivery_mode = "patch34_backend",
@@ -67,6 +68,21 @@ local SETTINGS = {
   watcher_post_activity_poll_interval_sec = 1.0,
   watcher_fast_watch_until_activity_sec = 120,
   watcher_stable_size_threshold_sec = 3.0,
+  watcher_missing_after_activity_cancel_sec = 3.0,
+  -- v0.2.7 (fix D): stop quietly (no notification, no timeout dialog) if the
+  -- Render dialog was opened but no real render activity is ever observed within
+  -- this many seconds. Covers "opened the Render dialog and closed it without
+  -- rendering" so the watcher does not keep running until watcher_max_watch_sec.
+  -- Increase this if you sometimes spend a long time configuring the dialog
+  -- before starting the render. Set to 0 to disable this early stop.
+  watcher_no_activity_timeout_sec = 10,
+  -- v0.2.7 (fix C): a render-finished notification additionally requires at least
+  -- this many distinct file-size events (the output file appearing, plus each
+  -- observed size growth). A static pre-existing file or a stalled partial
+  -- produces too few events and will not be reported as a finished render.
+  -- Set to 1 to restore pre-0.2.7 behavior if you render extremely short files
+  -- that may produce only a single observed size step at a 1 sec poll interval.
+  watcher_min_size_events_for_completion = 2,
   watcher_max_watch_sec = 300,
   verbose_watcher_log = false,
 
@@ -932,9 +948,18 @@ local function run_render_dialog_with_notification()
     project_changed_before_render_logged = false,
     activity_start_epoch = nil,
     activity_start_precise = nil,
+    missing_after_activity_since_precise = nil,
+    cancelled_or_discarded = false,
     notification_sent = false,
     timed_out = false,
     stopped = false,
+    -- v0.2.7: number of distinct file-size events observed (file appearing +
+    -- size growth steps). Used by the completion gate (fix C).
+    size_events = 0,
+    completion_gated_logged = false,
+    -- v0.2.8: one-shot flag for the render-in-progress gate log.
+    render_in_progress_gate_logged = false,
+    was_render_in_progress = false,
   }
 
   log("Render-dialog-with-notification path selected.")
@@ -972,6 +997,11 @@ local function run_render_dialog_with_notification()
   end
 
   local function finish_with_notification(now_epoch, now_precise, stable_for_sec)
+    if state.cancelled_or_discarded then
+      log("Completion candidate ignored because render was already marked cancelled or discarded.")
+      return
+    end
+
     if not state.render_started_seen then
       log("Completion candidate ignored because no real render activity was observed.")
       return
@@ -1009,8 +1039,14 @@ local function run_render_dialog_with_notification()
     log("Render-dialog watcher stopped after notification attempt.")
   end
 
+  local function stop_as_cancelled_or_discarded()
+    state.cancelled_or_discarded = true
+    state.stopped = true
+    log("Render appears to have been cancelled or discarded; watcher stopped without notification.")
+  end
+
   local function watcher_loop()
-    if state.stopped or state.notification_sent or state.timed_out then
+    if state.stopped or state.notification_sent or state.timed_out or state.cancelled_or_discarded then
       return
     end
 
@@ -1024,6 +1060,19 @@ local function run_render_dialog_with_notification()
       log("Render-dialog watcher timed out after " .. string.format("%.3f", elapsed_sec) .. " sec. No notification was sent.")
       log("Render-dialog watcher stopped after timeout.")
       show_message("Patch34 Render Telegram Notifier", "Render notification timed out. No Telegram message was sent.")
+      return
+    end
+
+    -- v0.2.7 (fix D): if no real render activity has ever been observed within the
+    -- no-activity window, assume the Render dialog was opened and then closed
+    -- without rendering, and stop quietly. This is a normal, expected outcome, so
+    -- no notification and no timeout dialog are shown.
+    local no_activity_timeout = tonumber(SETTINGS.watcher_no_activity_timeout_sec)
+    if not state.render_started_seen and no_activity_timeout and no_activity_timeout > 0
+      and elapsed_sec >= no_activity_timeout then
+      state.stopped = true
+      log("No render activity observed within " .. string.format("%.1f", no_activity_timeout)
+        .. " sec after opening the Render dialog. Assuming the dialog was closed without rendering; watcher stopped without notification.")
       return
     end
 
@@ -1050,6 +1099,25 @@ local function run_render_dialog_with_notification()
 
     if state.last_poll_precise == 0 or (now_precise - state.last_poll_precise) >= poll_interval then
       state.last_poll_precise = now_precise
+
+      -- v0.2.8: native render-in-progress signal. EnumProjects(0x40000000) returns
+      -- the project that REAPER is currently rendering, or nil when no render is
+      -- active. This is a core API call with no side effects or preference
+      -- requirements. Used to gate completion: the watcher will not send a
+      -- notification while a render is still in progress.
+      local rendering_proj = reaper.EnumProjects(0x40000000)
+      local render_in_progress = rendering_proj ~= nil
+
+      -- v0.2.8: when a render just ended (render_in_progress transitioned yes→no),
+      -- reset the stability timer. Without this, stable_for_sec carries over from
+      -- the last file write during the render, and completion fires instantly
+      -- before the missing-guard has a chance to detect file deletion on cancel.
+      if state.was_render_in_progress and not render_in_progress then
+        state.last_size_change_precise = now_precise
+        state.render_in_progress_gate_logged = false
+        log("Render ended (EnumProjects render flag cleared). Stability timer reset to allow file-deletion detection.")
+      end
+      state.was_render_in_progress = render_in_progress
 
       -- Guard against false positives caused by switching REAPER project tabs
       -- after opening the Render dialog but before any real render activity has
@@ -1097,23 +1165,34 @@ local function run_render_dialog_with_notification()
         state.last_size = size
         state.last_mtime = current_mtime
         state.last_size_change_precise = now_precise
+        state.missing_after_activity_since_precise = nil
         previous_fingerprint = current_fingerprint
         previous_size = size
         previous_mtime = current_mtime
         size_changed = false
         mtime_changed = false
         fingerprint_changed = false
-        file_appeared = file_exists
+        -- v0.2.7 (fix A): when the render output path itself changes (for example
+        -- the user picks/overwrites a file in the dialog), the new target may
+        -- already exist on disk. Its mere presence is NOT render activity. We
+        -- reset the baseline to the new target's current fingerprint and wait for
+        -- a real subsequent write (size growth, or an appearance from nonexistent)
+        -- before marking activity. This prevents false "finished" notifications
+        -- for overwrites and for focus/window switches that coincide with the
+        -- target resolving to a pre-existing file.
+        file_appeared = false
       end
 
       if file_appeared then
         log("Target file appeared or became readable. size_bytes=" .. tostring(size))
+        state.size_events = state.size_events + 1
         mark_activity(now_epoch, now_precise, "target file appeared")
         state.last_size_change_precise = now_precise
       elseif fingerprint_changed then
         log("Target file fingerprint changed: " .. describe_file_fingerprint(current_fingerprint))
         if size_changed then
           log("Target file size changed. size_bytes=" .. tostring(size))
+          state.size_events = state.size_events + 1
           mark_activity(now_epoch, now_precise, "target file size changed")
         elseif mtime_changed then
           log("Target file modification time changed. mtime=" .. tostring(current_mtime))
@@ -1122,6 +1201,28 @@ local function run_render_dialog_with_notification()
           mark_activity(now_epoch, now_precise, "target file fingerprint changed")
         end
         state.last_size_change_precise = now_precise
+      end
+
+      if state.render_started_seen and state.activity_seen and not file_exists then
+        if not state.missing_after_activity_since_precise then
+          state.missing_after_activity_since_precise = now_precise
+          log("Target file is missing/unreadable after render activity. Starting cancelled/discarded guard timer.")
+        end
+
+        local missing_for_sec = now_precise - state.missing_after_activity_since_precise
+        local cancel_threshold = math.max(0.5, tonumber(SETTINGS.watcher_missing_after_activity_cancel_sec) or 3.0)
+
+        if SETTINGS.verbose_watcher_log then
+          log("target missing after activity for " .. string.format("%.3f", missing_for_sec) .. " sec")
+        end
+
+        if missing_for_sec >= cancel_threshold then
+          stop_as_cancelled_or_discarded()
+          return
+        end
+      elseif state.missing_after_activity_since_precise then
+        log("Target file became readable again before cancelled/discarded threshold. Continuing watcher.")
+        state.missing_after_activity_since_precise = nil
       end
 
       state.last_fingerprint = current_fingerprint
@@ -1139,13 +1240,34 @@ local function run_render_dialog_with_notification()
           .. ", fingerprint=" .. describe_file_fingerprint(current_fingerprint)
           .. ", activity_seen=" .. (state.activity_seen and "yes" or "no")
           .. ", render_started_seen=" .. (state.render_started_seen and "yes" or "no")
+          .. ", cancelled_or_discarded=" .. (state.cancelled_or_discarded and "yes" or "no")
           .. ", stable_for_sec=" .. string.format("%.3f", stable_for_sec))
       end
 
       local stable_threshold = math.max(0.5, tonumber(SETTINGS.watcher_stable_size_threshold_sec) or 3.0)
-      if state.render_started_seen and state.activity_seen and file_exists and stable_for_sec >= stable_threshold then
-        finish_with_notification(now_epoch, now_precise, stable_for_sec)
-        return
+      local min_size_events = math.max(1, math.floor(tonumber(SETTINGS.watcher_min_size_events_for_completion) or 2))
+      if not state.cancelled_or_discarded and state.render_started_seen and state.activity_seen and file_exists and stable_for_sec >= stable_threshold then
+        if render_in_progress then
+          -- v0.2.8: REAPER is still rendering (EnumProjects(0x40000000) ~= nil).
+          -- The output file may appear stable due to system load, disk I/O pauses,
+          -- lock screen, or buffer flushing, but the render has not finished yet.
+          -- Do not notify until REAPER confirms the render is no longer active.
+          if not state.render_in_progress_gate_logged then
+            state.render_in_progress_gate_logged = true
+            log("Completion deferred: file is stable but REAPER reports a render is still in progress. Waiting for the render to actually finish before notifying.")
+          end
+        elseif state.size_events >= min_size_events then
+          finish_with_notification(now_epoch, now_precise, stable_for_sec)
+          return
+        elseif not state.completion_gated_logged then
+          -- v0.2.7 (fix C): the file is stable but too few distinct size events
+          -- were observed to trust this as a finished render (e.g. a static
+          -- pre-existing file, or a stalled partial). Do not notify. Logged once.
+          state.completion_gated_logged = true
+          log("Completion gated: file is stable but only " .. tostring(state.size_events)
+            .. " distinct size event(s) observed (need " .. tostring(min_size_events)
+            .. "). Not treating this as a finished render. If you render very short files, lower watcher_min_size_events_for_completion.")
+        end
       end
     end
 
