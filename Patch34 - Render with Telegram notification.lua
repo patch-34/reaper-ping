@@ -5,17 +5,18 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.8
+-- @version 0.2.9
 -- @author Aleksei Vorobev / Patch34
 -- @about
---   v0.2.8 adds a native render-in-progress gate via EnumProjects(0x40000000):
---   the watcher will not send a notification while REAPER is still rendering,
---   even if the output file appears stable (heavy system load, lock screen,
---   disk I/O pauses). This eliminates the class of false positives where file
---   size stability was mistaken for render completion. All v0.2.7 guards are
---   preserved. No backend, Telegram text, pairing, or notify changes.
+--   v0.2.9 repairs watcher timeout behavior for long renders. Timeout handling
+--   is now render-aware: the watcher checks REAPER's native render-in-progress
+--   flag before timeout decisions, never stops because of the absolute safety
+--   cap while REAPER is rendering, and starts a separate post-render timeout only
+--   after the native render flag has cleared. This preserves the existing native
+--   render-in-progress completion gate and all prior guards. No backend,
+--   Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.8"
+local SCRIPT_VERSION = "0.2.9"
 
 ------------------------------------------------------------
 -- User settings
@@ -69,13 +70,11 @@ local SETTINGS = {
   watcher_fast_watch_until_activity_sec = 120,
   watcher_stable_size_threshold_sec = 3.0,
   watcher_missing_after_activity_cancel_sec = 3.0,
-  -- v0.2.7 (fix D): stop quietly (no notification, no timeout dialog) if the
-  -- Render dialog was opened but no real render activity is ever observed within
-  -- this many seconds. Covers "opened the Render dialog and closed it without
-  -- rendering" so the watcher does not keep running until watcher_max_watch_sec.
-  -- Increase this if you sometimes spend a long time configuring the dialog
-  -- before starting the render. Set to 0 to disable this early stop.
-  watcher_no_activity_timeout_sec = 10,
+  -- v0.2.9: disabled by default because a user may spend more than a short
+  -- interval configuring the normal REAPER Render dialog before starting the
+  -- render. If set above 0, this quiet pre-render stop never sends a notification
+  -- and never shows a timeout message.
+  watcher_no_activity_timeout_sec = 0,
   -- v0.2.7 (fix C): a render-finished notification additionally requires at least
   -- this many distinct file-size events (the output file appearing, plus each
   -- observed size growth). A static pre-existing file or a stalled partial
@@ -83,7 +82,13 @@ local SETTINGS = {
   -- Set to 1 to restore pre-0.2.7 behavior if you render extremely short files
   -- that may produce only a single observed size step at a 1 sec poll interval.
   watcher_min_size_events_for_completion = 2,
-  watcher_max_watch_sec = 300,
+  -- v0.2.9: post-render unresolved timeout. This starts only after REAPER's
+  -- native render-in-progress flag changes from active to inactive.
+  watcher_post_render_timeout_sec = 120,
+  -- v0.2.9: large safety cap for pre-render / non-native-render states. It is
+  -- never applied while REAPER reports an active render via EnumProjects(0x40000000),
+  -- and it is not allowed to preempt the post-render settle phase.
+  watcher_max_watch_sec = 21600,
   verbose_watcher_log = false,
 
   -- Console behavior.
@@ -957,8 +962,13 @@ local function run_render_dialog_with_notification()
     -- size growth steps). Used by the completion gate (fix C).
     size_events = 0,
     completion_gated_logged = false,
-    -- v0.2.8: one-shot flag for the render-in-progress gate log.
+    -- Native render-in-progress gate: one-shot flag for the gate log.
     render_in_progress_gate_logged = false,
+    -- v0.2.9: explicit native-render lifecycle tracking for render-aware
+    -- timeout behavior. These fields are independent from file activity gates.
+    render_in_progress_seen = false,
+    render_ended_precise = nil,
+    last_render_in_progress_precise = nil,
     was_render_in_progress = false,
   }
 
@@ -1054,26 +1064,72 @@ local function run_render_dialog_with_notification()
     local now_epoch = os.time()
     local elapsed_sec = now_precise - state.opened_precise
 
-    if elapsed_sec >= SETTINGS.watcher_max_watch_sec then
-      state.timed_out = true
-      state.stopped = true
-      log("Render-dialog watcher timed out after " .. string.format("%.3f", elapsed_sec) .. " sec. No notification was sent.")
-      log("Render-dialog watcher stopped after timeout.")
-      show_message("Patch34 Render Telegram Notifier", "Render notification timed out. No Telegram message was sent.")
-      return
-    end
+    -- v0.2.9: native render-in-progress signal must be read before any timeout
+    -- decision that could stop the watcher. EnumProjects(0x40000000) returns the
+    -- project that REAPER is currently rendering, or nil when no render is active.
+    local rendering_proj = reaper.EnumProjects(0x40000000)
+    local render_in_progress = rendering_proj ~= nil
 
-    -- v0.2.7 (fix D): if no real render activity has ever been observed within the
-    -- no-activity window, assume the Render dialog was opened and then closed
-    -- without rendering, and stop quietly. This is a normal, expected outcome, so
-    -- no notification and no timeout dialog are shown.
-    local no_activity_timeout = tonumber(SETTINGS.watcher_no_activity_timeout_sec)
-    if not state.render_started_seen and no_activity_timeout and no_activity_timeout > 0
-      and elapsed_sec >= no_activity_timeout then
-      state.stopped = true
-      log("No render activity observed within " .. string.format("%.1f", no_activity_timeout)
-        .. " sec after opening the Render dialog. Assuming the dialog was closed without rendering; watcher stopped without notification.")
-      return
+    if render_in_progress then
+      state.render_in_progress_seen = true
+      state.last_render_in_progress_precise = now_precise
+      state.render_ended_precise = nil
+    elseif state.was_render_in_progress then
+      -- v0.2.9: when the native render flag transitions active→inactive, enter a
+      -- post-render settle phase. Reset stability timing so completion/cancel
+      -- detection can run after REAPER has actually finished rendering.
+      state.render_ended_precise = now_precise
+      state.last_size_change_precise = now_precise
+      state.render_in_progress_gate_logged = false
+      log("REAPER render ended (EnumProjects render flag cleared). Post-render settle phase started; stability timer reset.")
+    end
+    state.was_render_in_progress = render_in_progress
+
+    -- v0.2.9: while REAPER reports an active render, no watcher timeout is allowed
+    -- to stop the watcher or show a message box. Completion is also gated later.
+    if not render_in_progress then
+      local max_watch_sec = tonumber(SETTINGS.watcher_max_watch_sec)
+      if max_watch_sec and max_watch_sec > 0 and not state.render_in_progress_seen and elapsed_sec >= max_watch_sec then
+        state.timed_out = true
+        state.stopped = true
+        log("Render-dialog watcher reached absolute safety cap after " .. string.format("%.3f", elapsed_sec) .. " sec. No notification was sent.")
+        log("Render-dialog watcher stopped after absolute safety cap.")
+
+        if state.render_in_progress_seen or state.render_started_seen then
+          show_message("Patch34 Render Telegram Notifier", "Render notification timed out. No Telegram message was sent.")
+        else
+          log("Absolute safety cap reached before render activity. Watcher stopped quietly without timeout message.")
+        end
+        return
+      end
+
+      -- v0.2.7/v0.2.9: if configured, stop quietly when the Render dialog was
+      -- opened but no real render activity is ever observed before rendering
+      -- starts. This is a normal expected outcome: no notification and no timeout
+      -- dialog are shown.
+      local no_activity_timeout = tonumber(SETTINGS.watcher_no_activity_timeout_sec)
+      if not state.render_started_seen and not state.render_in_progress_seen
+        and no_activity_timeout and no_activity_timeout > 0 and elapsed_sec >= no_activity_timeout then
+        state.stopped = true
+        log("No render activity observed within " .. string.format("%.1f", no_activity_timeout)
+          .. " sec after opening the Render dialog. Assuming the dialog was closed without rendering; watcher stopped without notification.")
+        return
+      end
+
+      -- v0.2.9: after REAPER's native render flag has cleared, allow a bounded
+      -- post-render unresolved phase. This timeout cannot occur during rendering.
+      local post_render_timeout = tonumber(SETTINGS.watcher_post_render_timeout_sec)
+      if state.render_ended_precise and post_render_timeout and post_render_timeout > 0
+        and (now_precise - state.render_ended_precise) >= post_render_timeout then
+        state.timed_out = true
+        state.stopped = true
+        log("Render-dialog watcher timed out after post-render phase of "
+          .. string.format("%.3f", now_precise - state.render_ended_precise)
+          .. " sec. No notification was sent.")
+        log("Render-dialog watcher stopped after post-render timeout.")
+        show_message("Patch34 Render Telegram Notifier", "Render notification timed out. No Telegram message was sent.")
+        return
+      end
     end
 
     local poll_interval
@@ -1099,25 +1155,6 @@ local function run_render_dialog_with_notification()
 
     if state.last_poll_precise == 0 or (now_precise - state.last_poll_precise) >= poll_interval then
       state.last_poll_precise = now_precise
-
-      -- v0.2.8: native render-in-progress signal. EnumProjects(0x40000000) returns
-      -- the project that REAPER is currently rendering, or nil when no render is
-      -- active. This is a core API call with no side effects or preference
-      -- requirements. Used to gate completion: the watcher will not send a
-      -- notification while a render is still in progress.
-      local rendering_proj = reaper.EnumProjects(0x40000000)
-      local render_in_progress = rendering_proj ~= nil
-
-      -- v0.2.8: when a render just ended (render_in_progress transitioned yes→no),
-      -- reset the stability timer. Without this, stable_for_sec carries over from
-      -- the last file write during the render, and completion fires instantly
-      -- before the missing-guard has a chance to detect file deletion on cancel.
-      if state.was_render_in_progress and not render_in_progress then
-        state.last_size_change_precise = now_precise
-        state.render_in_progress_gate_logged = false
-        log("Render ended (EnumProjects render flag cleared). Stability timer reset to allow file-deletion detection.")
-      end
-      state.was_render_in_progress = render_in_progress
 
       -- Guard against false positives caused by switching REAPER project tabs
       -- after opening the Render dialog but before any real render activity has
@@ -1248,7 +1285,7 @@ local function run_render_dialog_with_notification()
       local min_size_events = math.max(1, math.floor(tonumber(SETTINGS.watcher_min_size_events_for_completion) or 2))
       if not state.cancelled_or_discarded and state.render_started_seen and state.activity_seen and file_exists and stable_for_sec >= stable_threshold then
         if render_in_progress then
-          -- v0.2.8: REAPER is still rendering (EnumProjects(0x40000000) ~= nil).
+          -- Native render-in-progress gate: REAPER is still rendering (EnumProjects(0x40000000) ~= nil).
           -- The output file may appear stable due to system load, disk I/O pauses,
           -- lock screen, or buffer flushing, but the render has not finished yet.
           -- Do not notify until REAPER confirms the render is no longer active.
