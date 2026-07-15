@@ -5,9 +5,12 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.11
+-- @version 0.2.12
 -- @author Aleksei Vorobev / Patch34
 -- @about
+--   v0.2.12 moves the "Reaper Ping armed" status window to the upper-left
+--   workspace area, above the track controls, where it is easier to notice.
+--
 --   v0.2.11 adds a small non-modal "Reaper Ping armed" status window while the
 --   render-dialog watcher is active, so it is visually clear that the render was
 --   started through the Patch34 action rather than REAPER's regular Render.
@@ -26,7 +29,7 @@
 --   render-in-progress completion gate and all prior guards. No backend,
 --   Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.11"
+local SCRIPT_VERSION = "0.2.12"
 
 ------------------------------------------------------------
 -- User settings
@@ -106,8 +109,8 @@ local SETTINGS = {
   show_status_window = true,
   status_window_width = 320,
   status_window_height = 72,
-  status_window_x = 80,
-  status_window_y = 80,
+  status_window_x = 40,
+  status_window_y = 244,
 
   -- Console behavior.
   -- Disabled by default for normal daily use. Set to true for debugging.
@@ -218,8 +221,8 @@ local function init_status_window(window_state)
 
   if not window_state.open then
     local width, height = get_status_window_size()
-    local x = math.floor(tonumber(SETTINGS.status_window_x) or 80)
-    local y = math.floor(tonumber(SETTINGS.status_window_y) or 80)
+    local x = math.floor(tonumber(SETTINGS.status_window_x) or 40)
+    local y = math.floor(tonumber(SETTINGS.status_window_y) or 244)
 
     gfx.init("Reaper Ping", width, height, 0, x, y)
     window_state.open = true
