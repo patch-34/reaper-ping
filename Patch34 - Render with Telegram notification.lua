@@ -5,9 +5,13 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.12
+-- @version 0.2.13
 -- @author Aleksei Vorobev / Patch34
 -- @about
+--   v0.2.13 makes closing the "Reaper Ping armed" status window before render
+--   activity cancel the watcher immediately, so the action can be run again
+--   without waiting for the long safety cap.
+--
 --   v0.2.12 moves the "Reaper Ping armed" status window to the upper-left
 --   workspace area, above the track controls, where it is easier to notice.
 --
@@ -29,7 +33,7 @@
 --   render-in-progress completion gate and all prior guards. No backend,
 --   Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.12"
+local SCRIPT_VERSION = "0.2.13"
 
 ------------------------------------------------------------
 -- User settings
@@ -1209,6 +1213,12 @@ local function run_render_dialog_with_notification()
     state.was_render_in_progress = render_in_progress
     state.status_window.mode = status_mode
     draw_status_window(state.status_window, status_mode, elapsed_sec)
+
+    if state.status_window.closed_by_user and not state.render_started_seen and not state.render_in_progress_seen then
+      state.stopped = true
+      log("Status window was closed before render activity. Watcher stopped so the action can be run again.")
+      return
+    end
 
     -- v0.2.9: while REAPER reports an active render, no watcher timeout is allowed
     -- to stop the watcher or show a message box. Completion is also gated later.
