@@ -5,9 +5,13 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.10
+-- @version 0.2.11
 -- @author Aleksei Vorobev / Patch34
 -- @about
+--   v0.2.11 adds a small non-modal "Reaper Ping armed" status window while the
+--   render-dialog watcher is active, so it is visually clear that the render was
+--   started through the Patch34 action rather than REAPER's regular Render.
+--
 --   v0.2.10 fixes long-render completion when file polling misses enough output
 --   activity. REAPER's native render-in-progress lifecycle now counts as a real
 --   render start signal and, after the native flag clears, can satisfy the
@@ -22,7 +26,7 @@
 --   render-in-progress completion gate and all prior guards. No backend,
 --   Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.10"
+local SCRIPT_VERSION = "0.2.11"
 
 ------------------------------------------------------------
 -- User settings
@@ -96,6 +100,14 @@ local SETTINGS = {
   -- and it is not allowed to preempt the post-render settle phase.
   watcher_max_watch_sec = 21600,
   verbose_watcher_log = false,
+
+  -- Small non-modal visual indicator shown while the Patch34 watcher is active.
+  -- If this window is visible, the current render was started through Reaper Ping.
+  show_status_window = true,
+  status_window_width = 320,
+  status_window_height = 72,
+  status_window_x = 80,
+  status_window_y = 80,
 
   -- Console behavior.
   -- Disabled by default for normal daily use. Set to true for debugging.
@@ -186,6 +198,92 @@ end
 
 local function show_message(title, message)
   reaper.MB(tostring(message or ""), tostring(title or "Patch34 Render Telegram Notifier"), 0)
+end
+
+local function get_status_window_size()
+  local width = math.max(220, math.floor(tonumber(SETTINGS.status_window_width) or 320))
+  local height = math.max(56, math.floor(tonumber(SETTINGS.status_window_height) or 72))
+
+  return width, height
+end
+
+local function init_status_window(window_state)
+  if not SETTINGS.show_status_window or type(gfx) ~= "table" or type(gfx.init) ~= "function" then
+    return false
+  end
+
+  if window_state.closed_by_user then
+    return false
+  end
+
+  if not window_state.open then
+    local width, height = get_status_window_size()
+    local x = math.floor(tonumber(SETTINGS.status_window_x) or 80)
+    local y = math.floor(tonumber(SETTINGS.status_window_y) or 80)
+
+    gfx.init("Reaper Ping", width, height, 0, x, y)
+    window_state.open = true
+  end
+
+  return true
+end
+
+local function close_status_window(window_state)
+  if window_state and window_state.open and type(gfx) == "table" and type(gfx.quit) == "function" then
+    gfx.quit()
+  end
+
+  if window_state then
+    window_state.open = false
+  end
+end
+
+local function draw_status_window(window_state, mode, elapsed_sec)
+  if not init_status_window(window_state) then
+    return
+  end
+
+  if type(gfx.getchar) == "function" and gfx.getchar() < 0 then
+    window_state.closed_by_user = true
+    window_state.open = false
+    return
+  end
+
+  local width, height = get_status_window_size()
+  local title = "Reaper Ping armed"
+  local detail = "Waiting for render..."
+  local r, g, b = 0.95, 0.48, 0.12
+
+  if mode == "rendering" then
+    title = "Rendering with Reaper Ping"
+    detail = "Telegram notification armed"
+    r, g, b = 0.09, 0.48, 0.68
+  elseif mode == "settling" then
+    title = "Render finished"
+    detail = "Preparing Telegram notification..."
+    r, g, b = 0.17, 0.58, 0.28
+  end
+
+  if type(elapsed_sec) == "number" and elapsed_sec >= 0 then
+    detail = detail .. "  " .. string.format("%.1f sec", elapsed_sec)
+  end
+
+  gfx.set(r, g, b, 1)
+  gfx.rect(0, 0, width, height, 1)
+
+  gfx.set(1, 1, 1, 1)
+  gfx.setfont(1, "Arial", 18)
+  gfx.x = 16
+  gfx.y = 14
+  gfx.drawstr(title)
+
+  gfx.set(1, 1, 1, 0.88)
+  gfx.setfont(2, "Arial", 13)
+  gfx.x = 16
+  gfx.y = 42
+  gfx.drawstr(detail)
+
+  gfx.update()
 end
 
 local function trim(value)
@@ -976,10 +1074,16 @@ local function run_render_dialog_with_notification()
     render_ended_precise = nil,
     last_render_in_progress_precise = nil,
     was_render_in_progress = false,
+    status_window = {
+      open = false,
+      closed_by_user = false,
+      mode = "armed",
+    },
   }
 
   log("Render-dialog-with-notification path selected.")
   log("Opening normal REAPER Render dialog command_id=" .. tostring(SETTINGS.render_dialog_action_command_id))
+  draw_status_window(state.status_window, "armed", 0)
 
   if initial_targets then
     log("Initial render target(s): " .. initial_targets)
@@ -1051,12 +1155,14 @@ local function run_render_dialog_with_notification()
       show_render_notification_failure(result)
     end
 
+    close_status_window(state.status_window)
     state.stopped = true
     log("Render-dialog watcher stopped after notification attempt.")
   end
 
   local function stop_as_cancelled_or_discarded()
     state.cancelled_or_discarded = true
+    close_status_window(state.status_window)
     state.stopped = true
     log("Render appears to have been cancelled or discarded; watcher stopped without notification.")
   end
@@ -1069,6 +1175,7 @@ local function run_render_dialog_with_notification()
     local now_precise = reaper.time_precise()
     local now_epoch = os.time()
     local elapsed_sec = now_precise - state.opened_precise
+    local status_mode = "armed"
 
     -- v0.2.9: native render-in-progress signal must be read before any timeout
     -- decision that could stop the watcher. EnumProjects(0x40000000) returns the
@@ -1077,11 +1184,13 @@ local function run_render_dialog_with_notification()
     local render_in_progress = rendering_proj ~= nil
 
     if render_in_progress then
+      status_mode = "rendering"
       state.render_in_progress_seen = true
       state.last_render_in_progress_precise = now_precise
       state.render_ended_precise = nil
       mark_activity(now_epoch, now_precise, "REAPER native render-in-progress flag")
     elseif state.was_render_in_progress then
+      status_mode = "settling"
       -- v0.2.9: when the native render flag transitions active→inactive, enter a
       -- post-render settle phase. Reset stability timing so completion/cancel
       -- detection can run after REAPER has actually finished rendering.
@@ -1089,8 +1198,14 @@ local function run_render_dialog_with_notification()
       state.last_size_change_precise = now_precise
       state.render_in_progress_gate_logged = false
       log("REAPER render ended (EnumProjects render flag cleared). Post-render settle phase started; stability timer reset.")
+    elseif state.render_ended_precise then
+      status_mode = "settling"
+    elseif state.activity_seen then
+      status_mode = "rendering"
     end
     state.was_render_in_progress = render_in_progress
+    state.status_window.mode = status_mode
+    draw_status_window(state.status_window, status_mode, elapsed_sec)
 
     -- v0.2.9: while REAPER reports an active render, no watcher timeout is allowed
     -- to stop the watcher or show a message box. Completion is also gated later.
@@ -1098,6 +1213,7 @@ local function run_render_dialog_with_notification()
       local max_watch_sec = tonumber(SETTINGS.watcher_max_watch_sec)
       if max_watch_sec and max_watch_sec > 0 and not state.render_in_progress_seen and elapsed_sec >= max_watch_sec then
         state.timed_out = true
+        close_status_window(state.status_window)
         state.stopped = true
         log("Render-dialog watcher reached absolute safety cap after " .. string.format("%.3f", elapsed_sec) .. " sec. No notification was sent.")
         log("Render-dialog watcher stopped after absolute safety cap.")
@@ -1117,6 +1233,7 @@ local function run_render_dialog_with_notification()
       local no_activity_timeout = tonumber(SETTINGS.watcher_no_activity_timeout_sec)
       if not state.render_started_seen and not state.render_in_progress_seen
         and no_activity_timeout and no_activity_timeout > 0 and elapsed_sec >= no_activity_timeout then
+        close_status_window(state.status_window)
         state.stopped = true
         log("No render activity observed within " .. string.format("%.1f", no_activity_timeout)
           .. " sec after opening the Render dialog. Assuming the dialog was closed without rendering; watcher stopped without notification.")
@@ -1129,6 +1246,7 @@ local function run_render_dialog_with_notification()
       if state.render_ended_precise and post_render_timeout and post_render_timeout > 0
         and (now_precise - state.render_ended_precise) >= post_render_timeout then
         state.timed_out = true
+        close_status_window(state.status_window)
         state.stopped = true
         log("Render-dialog watcher timed out after post-render phase of "
           .. string.format("%.3f", now_precise - state.render_ended_precise)
