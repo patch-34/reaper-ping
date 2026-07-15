@@ -5,9 +5,15 @@
 -- https://github.com/patch-34
 --
 -- @description Patch34: Render with Telegram notification
--- @version 0.2.9
+-- @version 0.2.10
 -- @author Aleksei Vorobev / Patch34
 -- @about
+--   v0.2.10 fixes long-render completion when file polling misses enough output
+--   activity. REAPER's native render-in-progress lifecycle now counts as a real
+--   render start signal and, after the native flag clears, can satisfy the
+--   completion gate even if fewer than watcher_min_size_events_for_completion
+--   file-size events were observed.
+--
 --   v0.2.9 repairs watcher timeout behavior for long renders. Timeout handling
 --   is now render-aware: the watcher checks REAPER's native render-in-progress
 --   flag before timeout decisions, never stops because of the absolute safety
@@ -16,7 +22,7 @@
 --   render-in-progress completion gate and all prior guards. No backend,
 --   Telegram text, pairing, or notify changes.
 
-local SCRIPT_VERSION = "0.2.9"
+local SCRIPT_VERSION = "0.2.10"
 
 ------------------------------------------------------------
 -- User settings
@@ -1074,6 +1080,7 @@ local function run_render_dialog_with_notification()
       state.render_in_progress_seen = true
       state.last_render_in_progress_precise = now_precise
       state.render_ended_precise = nil
+      mark_activity(now_epoch, now_precise, "REAPER native render-in-progress flag")
     elseif state.was_render_in_progress then
       -- v0.2.9: when the native render flag transitions active→inactive, enter a
       -- post-render settle phase. Reset stability timing so completion/cancel
@@ -1283,6 +1290,7 @@ local function run_render_dialog_with_notification()
 
       local stable_threshold = math.max(0.5, tonumber(SETTINGS.watcher_stable_size_threshold_sec) or 3.0)
       local min_size_events = math.max(1, math.floor(tonumber(SETTINGS.watcher_min_size_events_for_completion) or 2))
+      local native_render_completed = state.render_in_progress_seen and state.render_ended_precise ~= nil
       if not state.cancelled_or_discarded and state.render_started_seen and state.activity_seen and file_exists and stable_for_sec >= stable_threshold then
         if render_in_progress then
           -- Native render-in-progress gate: REAPER is still rendering (EnumProjects(0x40000000) ~= nil).
@@ -1293,7 +1301,12 @@ local function run_render_dialog_with_notification()
             state.render_in_progress_gate_logged = true
             log("Completion deferred: file is stable but REAPER reports a render is still in progress. Waiting for the render to actually finish before notifying.")
           end
-        elseif state.size_events >= min_size_events then
+        elseif native_render_completed or state.size_events >= min_size_events then
+          if native_render_completed and state.size_events < min_size_events then
+            log("Completion allowed by REAPER native render lifecycle after observing only "
+              .. tostring(state.size_events)
+              .. " distinct size event(s).")
+          end
           finish_with_notification(now_epoch, now_precise, stable_for_sec)
           return
         elseif not state.completion_gated_logged then
