@@ -407,7 +407,7 @@ async function handleNotify(request, env) {
 
   await sendTelegramMessage(env, {
     chatId: stored.chat_id,
-    text: `<b>${escapedFilename}</b> finished ✅`,
+    text: `<b>${escapedFilename}</b> finished`,
     parseMode: "HTML",
   });
 
